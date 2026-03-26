@@ -9,23 +9,21 @@ import SwiftUI
 import ARKit
 import AVFoundation
 import Combine
-import CoreImage
 
 @MainActor
 struct ContentView: View {
 
-    @StateObject private var arSession   = ARSessionManager()
-    @StateObject private var recorder    = DualVideoRecorder()
+    @StateObject private var arSession    = ARSessionManager()
+    @StateObject private var recorder     = DualVideoRecorder()
     @StateObject private var depthOverlay = DepthOverlayProcessor()
 
     @State private var showDepthOverlay = false
     @State private var showSavedToast   = false
-    @State private var viewportSize: CGSize = .zero
 
     var body: some View {
         ZStack(alignment: .bottom) {
             if arSession.isSupported {
-                // Camera feed
+                // Camera feed — fills full screen including safe areas.
                 CameraPreviewView(session: arSession.session)
                     .ignoresSafeArea()
                     .onAppear {
@@ -34,8 +32,9 @@ struct ContentView: View {
                     }
                     .onDisappear { arSession.pause() }
 
-                // Depth matte — rendered to viewport size by DepthOverlayProcessor
-                // so no scaling is needed; just fill + clip to avoid layout overflow.
+                // Depth matte — processor renders it at the full-screen size and
+                // already applies the same displayTransform ARSCNView uses, so no
+                // additional scaling/rotation is needed here.
                 if showDepthOverlay, let img = depthOverlay.image {
                     Image(uiImage: img)
                         .resizable()
@@ -47,27 +46,32 @@ struct ContentView: View {
                 }
 
                 ControlBar(
-                    isRecording:     .init(get: { recorder.isRecording }, set: { _ in }),
-                    maxDepth:        Binding(get: { recorder.maxDepth },
-                                            set: { recorder.maxDepth = $0 }),
+                    isRecording:      .init(get: { recorder.isRecording }, set: { _ in }),
+                    maxDepth:         Binding(get: { recorder.maxDepth },
+                                             set: { recorder.maxDepth = $0 }),
                     showDepthOverlay: $showDepthOverlay,
-                    showSavedToast:  showSavedToast,
-                    onRecordToggle:  toggleRecording
+                    showSavedToast:   showSavedToast,
+                    onRecordToggle:   toggleRecording
                 )
             } else {
                 UnsupportedDeviceView()
             }
         }
         .background(Color.black)
-        // Capture the actual layout size so depth images are rendered to the right dimensions.
-        .onGeometryChange(for: CGSize.self) { $0.size } action: { viewportSize = $0 }
+        // Use a full-screen GeometryReader (ignoresSafeArea) so viewportSize matches
+        // the size ARSCNView uses when calling displayTransform(for:viewportSize:).
+        .background(
+            GeometryReader { geo in
+                Color.clear
+                    .onAppear            { depthOverlay.viewportSize = geo.size }
+                    .onChange(of: geo.size) { _, s in depthOverlay.viewportSize = s }
+            }
+            .ignoresSafeArea()
+        )
         .onChange(of: recorder.savedToPhotos) { _, saved in if saved { showToast() } }
         .onChange(of: showDepthOverlay) { _, enabled in
             depthOverlay.isEnabled = enabled
             if !enabled { depthOverlay.image = nil }
-        }
-        .onChange(of: viewportSize) { _, size in
-            depthOverlay.viewportSize = size
         }
     }
 
@@ -77,9 +81,7 @@ struct ContentView: View {
         let overlay = depthOverlay
         arSession.onFrame = { [weak recorder, weak overlay] frame in
             recorder?.appendFrame(frame)
-            overlay?.process(frame: frame,
-                             maxDepth: recorder?.maxDepth ?? 5.0,
-                             viewportSize: overlay?.viewportSize ?? .zero)
+            overlay?.process(frame: frame, maxDepth: recorder?.maxDepth ?? 5.0)
         }
     }
 
@@ -115,131 +117,119 @@ struct ContentView: View {
 
 // MARK: - Depth overlay processor
 
-/// Converts ARFrame depth maps to viewport-aligned UIImages using ARKit's displayTransform.
-/// CoreImage (GPU) handles the affine warp; CPU only does the Float32→UInt8 normalisation.
+/// Converts each ARFrame's depth map to a UIImage that is pixel-aligned with ARSCNView's
+/// camera display, using ARKit's displayTransform to backward-sample the depth map.
+///
+/// Coordinate reasoning:
+///   `frame.displayTransform(for:viewportSize:)` maps camera UV → display UV
+///   (both in Metal/UIKit y-down convention, (0,0) upper-left).
+///   Apple's own ARKit sample code inverts it in the shader to map display→camera.
+///   We do the same: for each OUTPUT pixel at display UV (ox/W, oy/H), compute
+///   the INPUT depth pixel via displayTransform.inverted() and sample.
 final class DepthOverlayProcessor: ObservableObject {
     @Published var image: UIImage?
-    var isEnabled   = false
-    /// Set from ContentView via onGeometryChange before any frame is processed.
+    var isEnabled    = false
     var viewportSize: CGSize = .zero
 
-    private let queue     = DispatchQueue(label: "com.immanuel.pointcloud.depthoverlay",
-                                          qos: .userInitiated)
-    private let ciContext = CIContext(options: [.useSoftwareRenderer: false])
+    private let queue = DispatchQueue(label: "com.immanuel.pointcloud.depthoverlay",
+                                      qos: .userInitiated)
 
-    // Reusable BGRA pool — recreated when depth map size changes.
-    private var bgraPool:  CVPixelBufferPool?
-    private var poolDepthW = 0
-    private var poolDepthH = 0
+    // Reuse output buffer across frames to avoid per-frame heap allocations.
+    private var outBuf   = [UInt8]()
+    private var outW     = 0
+    private var outH     = 0
 
-    func process(frame: ARFrame, maxDepth: Float, viewportSize: CGSize) {
+    func process(frame: ARFrame, maxDepth: Float) {
         guard isEnabled,
-              viewportSize != .zero,
+              viewportSize.width > 0, viewportSize.height > 0,
               let depthMap = frame.sceneDepth?.depthMap else { return }
 
-        // Capture everything needed before leaving the main thread.
-        let transform = frame.displayTransform(for: .portrait, viewportSize: viewportSize)
-        let depthW    = CVPixelBufferGetWidth(depthMap)
-        let depthH    = CVPixelBufferGetHeight(depthMap)
+        // Capture everything on the main thread before hopping to the queue.
+        let transform  = frame.displayTransform(for: .portrait, viewportSize: viewportSize)
+        let invTransform = transform.inverted()   // display UV → camera UV
+        let vs         = viewportSize
 
         queue.async { [weak self] in
             guard let self else { return }
-
-            // Ensure BGRA pool matches current depth map dimensions.
-            if depthW != poolDepthW || depthH != poolDepthH {
-                let attrs: [CFString: Any] = [
-                    kCVPixelBufferPixelFormatTypeKey:     kCVPixelFormatType_32BGRA,
-                    kCVPixelBufferWidthKey:               depthW,
-                    kCVPixelBufferHeightKey:              depthH,
-                    kCVPixelBufferIOSurfacePropertiesKey: [:] as [CFString: Any]
-                ]
-                var pool: CVPixelBufferPool?
-                CVPixelBufferPoolCreate(nil, nil, attrs as CFDictionary, &pool)
-                bgraPool   = pool
-                poolDepthW = depthW
-                poolDepthH = depthH
-            }
-            guard let pool = bgraPool else { return }
-
-            let img = makeAlignedImage(
-                depthMap:         depthMap,
-                depthW:           depthW,  depthH: depthH,
-                maxDepth:         maxDepth,
-                displayTransform: transform,
-                viewportSize:     viewportSize,
-                bgraPool:         pool)
-
+            let img = self.render(depthMap: depthMap, maxDepth: maxDepth,
+                                  invTransform: invTransform, viewportSize: vs)
             DispatchQueue.main.async { self.image = img }
         }
     }
 
     // MARK: - Private
 
-    /// 1. Normalise Float32 depth → BGRA pixel buffer (CPU, ~49 K px)
-    /// 2. Wrap as CIImage, apply ARKit displayTransform (GPU), render to viewport size.
-    private func makeAlignedImage(
-        depthMap: CVPixelBuffer,
-        depthW: Int, depthH: Int,
-        maxDepth: Float,
-        displayTransform: CGAffineTransform,
-        viewportSize: CGSize,
-        bgraPool: CVPixelBufferPool
-    ) -> UIImage? {
+    /// Backward-samples the depth map using the inverted displayTransform.
+    /// Both coordinate spaces are y-down (Metal/UIKit convention).
+    private func render(depthMap: CVPixelBuffer,
+                        maxDepth: Float,
+                        invTransform: CGAffineTransform,
+                        viewportSize: CGSize) -> UIImage? {
 
-        // --- Step 1: depth Float32 → BGRA 8-bit ---
-        var outBuf: CVPixelBuffer?
-        guard CVPixelBufferPoolCreatePixelBuffer(nil, bgraPool, &outBuf) == kCVReturnSuccess,
-              let bgra = outBuf else { return nil }
+        let dW = CVPixelBufferGetWidth(depthMap)
+        let dH = CVPixelBufferGetHeight(depthMap)
+        let oW = Int(viewportSize.width)
+        let oH = Int(viewportSize.height)
+        guard oW > 0, oH > 0 else { return nil }
+
+        // Resize output buffer if dimensions changed.
+        let needed = oW * oH * 4
+        if outBuf.count != needed {
+            outBuf = [UInt8](repeating: 255, count: needed)
+            outW = oW; outH = oH
+        }
 
         CVPixelBufferLockBaseAddress(depthMap, .readOnly)
-        CVPixelBufferLockBaseAddress(bgra, [])
-        do {
-            let floats  = CVPixelBufferGetBaseAddress(depthMap)!.assumingMemoryBound(to: Float32.self)
-            let bytes   = CVPixelBufferGetBaseAddress(bgra)!.assumingMemoryBound(to: UInt8.self)
-            let rowBytes = CVPixelBufferGetBytesPerRow(bgra)
-            for y in 0..<depthH {
-                for x in 0..<depthW {
-                    let v    = UInt8(max(0, min(1, 1 - floats[y * depthW + x] / maxDepth)) * 255)
-                    let base = y * rowBytes + x * 4
-                    bytes[base]     = v   // B
-                    bytes[base + 1] = v   // G
-                    bytes[base + 2] = v   // R
-                    bytes[base + 3] = 255 // A
-                }
+        defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
+        let floats = CVPixelBufferGetBaseAddress(depthMap)!.assumingMemoryBound(to: Float32.self)
+
+        let dWf = CGFloat(dW)
+        let dHf = CGFloat(dH)
+        let oWf = CGFloat(oW)
+        let oHf = CGFloat(oH)
+
+        // Pre-extract transform components to avoid CGPoint.applying overhead in hot loop.
+        let a = invTransform.a;  let b = invTransform.b
+        let c = invTransform.c;  let d = invTransform.d
+        let tx = invTransform.tx; let ty = invTransform.ty
+
+        for oy in 0..<oH {
+            let ny = CGFloat(oy) / oHf               // display UV y in [0,1]
+            for ox in 0..<oW {
+                let nx = CGFloat(ox) / oWf           // display UV x in [0,1]
+
+                // invTransform: display UV → camera UV (both y-down, (0,0) upper-left)
+                let cu = a * nx + c * ny + tx
+                let cv = b * nx + d * ny + ty
+
+                // Camera UV → depth pixel (clamp to valid range)
+                let dx = Int(max(0, min(dWf - 1, cu * dWf)))
+                let dy = Int(max(0, min(dHf - 1, cv * dHf)))
+
+                let depth = floats[dy * dW + dx]
+                // NaN (unmeasured pixel) → treat as max depth (black)
+                let v = depth.isNaN ? 0 : UInt8(max(0, min(1, 1 - depth / maxDepth)) * 255)
+
+                let base = (oy * oW + ox) * 4
+                outBuf[base]     = v   // R
+                outBuf[base + 1] = v   // G
+                outBuf[base + 2] = v   // B
+                // outBuf[base + 3] = 255 (alpha stays 255 from init)
             }
         }
-        CVPixelBufferUnlockBaseAddress(bgra, [])
-        CVPixelBufferUnlockBaseAddress(depthMap, .readOnly)
 
-        // --- Step 2: CIImage + ARKit displayTransform (GPU) ---
-        //
-        // ARKit image UV: (0,0) at lower-left (y-up).
-        // displayTransform maps camera UV → UIKit viewport UV (y-down, upper-left origin).
-        //
-        // CIImage also uses y-up (lower-left origin), so we must y-flip the
-        // displayTransform output to bring it back into CIImage space before scaling.
-        //
-        //   full = scaleDown · displayTransform · yFlip · scaleUp
-        //
-        // After CIContext.createCGImage(from:) the y-axis is flipped one final
-        // time (CIImage→CGImage), which undoes our yFlip and gives the correct
-        // portrait image.
+        guard let provider = CGDataProvider(data: Data(outBuf) as CFData),
+              let cg = CGImage(
+                  width: oW, height: oH,
+                  bitsPerComponent: 8, bitsPerPixel: 32,
+                  bytesPerRow: oW * 4,
+                  space: CGColorSpaceCreateDeviceRGB(),
+                  bitmapInfo: .init(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue),
+                  provider: provider,
+                  decode: nil, shouldInterpolate: false,
+                  intent: .defaultIntent) else { return nil }
 
-        let scaleDown = CGAffineTransform(scaleX: 1 / CGFloat(depthW),
-                                          y:      1 / CGFloat(depthH))
-        let yFlip     = CGAffineTransform(a: 1, b: 0, c: 0, d: -1, tx: 0, ty: 1)
-        let scaleUp   = CGAffineTransform(scaleX: viewportSize.width,
-                                          y:      viewportSize.height)
-        let fullT     = scaleDown
-            .concatenating(displayTransform)
-            .concatenating(yFlip)
-            .concatenating(scaleUp)
-
-        let ciImage   = CIImage(cvPixelBuffer: bgra).transformed(by: fullT)
-        let bounds    = CGRect(origin: .zero, size: viewportSize)
-
-        guard let cg  = ciContext.createCGImage(ciImage, from: bounds) else { return nil }
-        return UIImage(cgImage: cg) // .up — already in viewport space
+        return UIImage(cgImage: cg)  // .up — already in display (y-down) space
     }
 }
 
