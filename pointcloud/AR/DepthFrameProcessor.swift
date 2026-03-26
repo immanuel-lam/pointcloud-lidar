@@ -11,10 +11,12 @@ import Accelerate
 final class DepthFrameProcessor {
 
     /// Sample every Nth pixel in both X and Y. Higher = fewer points, better perf.
-    var subsampleStep: Int = 4
+    nonisolated(unsafe) var subsampleStep: Int = 4
 
     /// Process an ARFrame into an array of RGB-coloured 3-D vertices.
-    func process(_ frame: ARFrame) -> [PointVertex] {
+    /// Marked nonisolated so it can be called from background tasks.
+    nonisolated func process(_ frame: ARFrame) -> [PointVertex] {
+        let subsampleStep = self.subsampleStep
         // Prefer smoothed depth; fall back to raw.
         guard let depthData = frame.smoothedSceneDepth ?? frame.sceneDepth,
               let confidenceBuffer = depthData.confidenceMap else { return [] }
@@ -112,7 +114,7 @@ final class DepthFrameProcessor {
         return vertices
     }
 
-    private func clamp(_ value: Float, _ lo: Float, _ hi: Float) -> Float {
+    private nonisolated func clamp(_ value: Float, _ lo: Float, _ hi: Float) -> Float {
         Swift.max(lo, Swift.min(hi, value))
     }
 }
