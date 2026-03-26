@@ -92,12 +92,18 @@ struct ContentView: View {
         guard let r = MetalRenderer(mtkView: mtkView) else { return }
         renderer = r
 
+        let proc    = processor
+        let mtkView = mtkView
+
         arSession.onFrame = { [weak r] frame in
             guard let r else { return }
-            let vertices = self.processor.process(frame)
-            Task { @MainActor in
-                r.currentVertices = vertices
-                r.updateCamera(frame: frame, viewportSize: self.mtkView.drawableSize)
+            // Offload heavy depth processing off the main thread
+            Task.detached(priority: .userInitiated) {
+                let vertices = proc.process(frame)
+                await MainActor.run {
+                    r.currentVertices = vertices
+                    r.updateCamera(frame: frame, viewportSize: mtkView.drawableSize)
+                }
             }
         }
 
