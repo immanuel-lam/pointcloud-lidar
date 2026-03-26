@@ -13,8 +13,8 @@ import Combine
 @MainActor
 struct ContentView: View {
 
-    @StateObject private var arSession  = ARSessionManager()
-    @StateObject private var recorder   = DualVideoRecorder()
+    @StateObject private var arSession    = ARSessionManager()
+    @StateObject private var recorder     = DualVideoRecorder()
     @StateObject private var depthOverlay = DepthOverlayProcessor()
 
     @State private var showDepthOverlay = false
@@ -23,7 +23,6 @@ struct ContentView: View {
     var body: some View {
         ZStack(alignment: .bottom) {
             if arSession.isSupported {
-                // Camera feed
                 CameraPreviewView(session: arSession.session)
                     .ignoresSafeArea()
                     .onAppear {
@@ -32,25 +31,24 @@ struct ContentView: View {
                     }
                     .onDisappear { arSession.pause() }
 
-                // Depth matte overlay
-                if showDepthOverlay, let img = depthOverlay.image {
-                    Image(uiImage: img)
-                        .resizable()
-                        .scaledToFill()
+                // Depth matte — UIViewRepresentable pushes image directly to UIImageView,
+                // bypassing SwiftUI's render pipeline so frame updates never cause
+                // ContentView (and the ControlBar) to re-render and drop touches.
+                if showDepthOverlay {
+                    DepthOverlayView(processor: depthOverlay)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .clipped()
                         .ignoresSafeArea()
                         .opacity(0.75)
                         .allowsHitTesting(false)
                 }
 
                 ControlBar(
-                    isRecording:    .init(get: { recorder.isRecording }, set: { _ in }),
-                    maxDepth:       Binding(get: { recorder.maxDepth },
-                                           set: { recorder.maxDepth = $0 }),
+                    isRecording:      .init(get: { recorder.isRecording }, set: { _ in }),
+                    maxDepth:         Binding(get: { recorder.maxDepth },
+                                             set: { recorder.maxDepth = $0 }),
                     showDepthOverlay: $showDepthOverlay,
-                    showSavedToast: showSavedToast,
-                    onRecordToggle: toggleRecording
+                    showSavedToast:   showSavedToast,
+                    onRecordToggle:   toggleRecording
                 )
             } else {
                 UnsupportedDeviceView()
@@ -58,16 +56,13 @@ struct ContentView: View {
         }
         .background(Color.black)
         .onChange(of: recorder.savedToPhotos) { _, saved in if saved { showToast() } }
-        .onChange(of: showDepthOverlay) { _, enabled in
-            depthOverlay.isEnabled = enabled
-            if !enabled { depthOverlay.image = nil }
-        }
+        .onChange(of: showDepthOverlay) { _, enabled in depthOverlay.isEnabled = enabled }
     }
 
     // MARK: - Setup
 
     private func setupFrameCallback() {
-        let overlay  = depthOverlay
+        let overlay = depthOverlay
         arSession.onFrame = { [weak recorder, weak overlay] frame in
             recorder?.appendFrame(frame)
             overlay?.process(frame: frame, maxDepth: recorder?.maxDepth ?? 5.0)
@@ -104,45 +99,63 @@ struct ContentView: View {
     }
 }
 
+// MARK: - Depth overlay UIKit view
+
+/// Wraps a UIImageView so the processor can push images directly without going
+/// through SwiftUI's @Published → objectWillChange → full ContentView re-render path.
+struct DepthOverlayView: UIViewRepresentable {
+    let processor: DepthOverlayProcessor
+
+    func makeUIView(context: Context) -> UIImageView {
+        let iv = UIImageView()
+        iv.contentMode = .scaleAspectFill
+        iv.clipsToBounds = true
+        iv.isUserInteractionEnabled = false
+        processor.imageView = iv
+        return iv
+    }
+
+    func updateUIView(_ uiView: UIImageView, context: Context) {
+        processor.imageView = uiView
+    }
+}
+
 // MARK: - Depth overlay processor
 
-/// Converts ARFrame depth maps to displayable UIImages on a background queue.
-/// Keeping this as an ObservableObject lets SwiftUI re-render only the overlay layer.
+/// Generates depth images on a background queue and writes them straight to
+/// a UIImageView — no @Published, no SwiftUI re-renders while the overlay is live.
 final class DepthOverlayProcessor: ObservableObject {
-    @Published var image: UIImage?
 
-    /// Set to false to skip conversion (zero overhead when overlay is hidden).
+    /// Weak so the UIImageView is released when the SwiftUI view is removed.
+    weak var imageView: UIImageView?
     var isEnabled = false
 
     private let queue = DispatchQueue(label: "com.immanuel.pointcloud.depthoverlay",
                                       qos: .userInitiated)
 
     func process(frame: ARFrame, maxDepth: Float) {
-        guard isEnabled, let depthMap = frame.sceneDepth?.depthMap else { return }
+        guard isEnabled, imageView != nil,
+              let depthMap = frame.sceneDepth?.depthMap else { return }
         queue.async { [weak self] in
             let img = Self.makeImage(from: depthMap, maxDepth: maxDepth)
-            DispatchQueue.main.async { self?.image = img }
+            DispatchQueue.main.async { self?.imageView?.image = img }
         }
     }
 
-    /// Converts `kCVPixelFormatType_DepthFloat32` (landscape) to a portrait UIImage.
-    /// near (0 m) → white, far (≥ maxDepth) → black.
     private static func makeImage(from depthMap: CVPixelBuffer, maxDepth: Float) -> UIImage? {
         CVPixelBufferLockBaseAddress(depthMap, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
 
-        let w       = CVPixelBufferGetWidth(depthMap)
-        let h       = CVPixelBufferGetHeight(depthMap)
-        let floats  = CVPixelBufferGetBaseAddress(depthMap)!.assumingMemoryBound(to: Float32.self)
+        let w      = CVPixelBufferGetWidth(depthMap)
+        let h      = CVPixelBufferGetHeight(depthMap)
+        let floats = CVPixelBufferGetBaseAddress(depthMap)!.assumingMemoryBound(to: Float32.self)
 
-        // Write RGBA — all channels equal (greyscale), alpha opaque.
         var rgba = [UInt8](repeating: 255, count: w * h * 4)
         for i in 0..<(w * h) {
             let v = UInt8(max(0, min(1, 1 - floats[i] / maxDepth)) * 255)
             rgba[i * 4 + 0] = v
             rgba[i * 4 + 1] = v
             rgba[i * 4 + 2] = v
-            // rgba[i * 4 + 3] = 255 (already set)
         }
 
         guard let provider = CGDataProvider(data: Data(rgba) as CFData),
@@ -156,7 +169,6 @@ final class DepthOverlayProcessor: ObservableObject {
                   decode: nil, shouldInterpolate: true,
                   intent: .defaultIntent) else { return nil }
 
-        // .right orientation: landscape pixel data displayed rotated 90° CW → portrait
         return UIImage(cgImage: cg, scale: 1.0, orientation: .right)
     }
 }
