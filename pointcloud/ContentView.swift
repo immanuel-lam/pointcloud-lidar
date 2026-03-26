@@ -6,16 +6,134 @@
 //
 
 import SwiftUI
+import MetalKit
+import ARKit
 
+@MainActor
 struct ContentView: View {
+
+    @StateObject private var arSession  = ARSessionManager()
+    @StateObject private var recorder   = VideoRecorder(width: 1920, height: 1080, fps: 30)
+
+    @State private var renderer: MetalRenderer?
+    @State private var mtkView  = MTKView()
+
+    @State private var pointSize: Float  = 6.0
+    @State private var subsampleStep     = 4
+    @State private var showSavedToast    = false
+
+    private let processor = DepthFrameProcessor()
+
     var body: some View {
-        VStack {
-            Image(systemName: "globe")
-                .imageScale(.large)
-                .foregroundStyle(.tint)
-            Text("Hello, world!")
+        ZStack(alignment: .bottom) {
+            if arSession.isSupported {
+                // Full-screen Metal view
+                MetalViewWrapper(mtkView: mtkView)
+                    .ignoresSafeArea()
+                    .onAppear {
+                        setupRenderer()
+                        arSession.start()
+                    }
+                    .onDisappear {
+                        arSession.pause()
+                    }
+
+                // HUD overlay
+                ControlBar(
+                    isRecording:   .init(get: { recorder.isRecording },
+                                         set: { _ in }),
+                    pointSize:     $pointSize,
+                    subsampleStep: $subsampleStep,
+                    showSavedToast: showSavedToast,
+                    onRecordToggle: toggleRecording
+                )
+            } else {
+                UnsupportedDeviceView()
+            }
         }
-        .padding()
+        .background(Color.black)
+        .onChange(of: pointSize) { _, size in
+            renderer?.pointSize = size
+        }
+        .onChange(of: subsampleStep) { _, step in
+            processor.subsampleStep = step
+        }
+    }
+
+    // MARK: - Setup
+
+    private func setupRenderer() {
+        guard renderer == nil else { return }
+        guard let r = MetalRenderer(mtkView: mtkView) else { return }
+        renderer = r
+
+        arSession.onFrame = { [weak r] frame in
+            guard let r else { return }
+            let vertices = self.processor.process(frame)
+            Task { @MainActor in
+                r.currentVertices = vertices
+                r.updateCamera(frame: frame, viewportSize: self.mtkView.drawableSize)
+            }
+        }
+
+        r.onFrameRendered = { [weak recorder] texture, time in
+            recorder?.appendFrame(texture: texture, at: time)
+        }
+    }
+
+    // MARK: - Recording
+
+    private func toggleRecording() {
+        guard let device = mtkView.device else { return }
+        if recorder.isRecording {
+            recorder.stopRecording()
+            showToast()
+        } else {
+            recorder.startRecording(device: device)
+        }
+    }
+
+    private func showToast() {
+        withAnimation { showSavedToast = true }
+        Task {
+            try? await Task.sleep(for: .seconds(2))
+            withAnimation { showSavedToast = false }
+        }
+    }
+}
+
+// MARK: - MTKView wrapper
+
+struct MetalViewWrapper: UIViewRepresentable {
+    let mtkView: MTKView
+
+    func makeUIView(context: Context) -> MTKView {
+        mtkView.backgroundColor = .black
+        mtkView.isPaused        = false
+        mtkView.enableSetNeedsDisplay = false
+        mtkView.preferredFramesPerSecond = 60
+        return mtkView
+    }
+
+    func updateUIView(_ uiView: MTKView, context: Context) {}
+}
+
+// MARK: - Unsupported device
+
+struct UnsupportedDeviceView: View {
+    var body: some View {
+        VStack(spacing: 16) {
+            Image(systemName: "camera.metering.none")
+                .font(.system(size: 64))
+                .foregroundStyle(.secondary)
+            Text("LiDAR Not Available")
+                .font(.title2.bold())
+            Text("This app requires an iPhone with a LiDAR scanner (iPhone 12 Pro or later).")
+                .font(.body)
+                .multilineTextAlignment(.center)
+                .foregroundStyle(.secondary)
+        }
+        .padding(32)
     }
 }
 
