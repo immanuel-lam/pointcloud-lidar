@@ -13,6 +13,7 @@ import Photos
 /// Records two synced MP4 files simultaneously:
 ///   - `rgb_<ts>.mp4`   — H.264 colour video from ARFrame.capturedImage (YCbCr)
 ///   - `depth_<ts>.mp4` — greyscale depth map (near=white, far=black), H.264
+///                         upsampled to full camera resolution via guided bilateral filter
 ///
 /// Writers are lazily created on the first `appendFrame` call after `startRecording`,
 /// so video dimensions are read directly from the live ARFrame.
@@ -32,6 +33,9 @@ final class DualVideoRecorder: ObservableObject {
     private var depthAdaptor: AVAssetWriterInputPixelBufferAdaptor?
     private var depthPool:    CVPixelBufferPool?
     private var startTime:    TimeInterval?
+
+    /// Guided bilateral upsampler — created once, reused every frame.
+    private let upsampler = GuidedDepthUpsampler()
 
     private let recordingQueue = DispatchQueue(label: "com.immanuel.pointcloud.dualrecording",
                                                qos: .userInitiated)
@@ -65,13 +69,22 @@ final class DualVideoRecorder: ObservableObject {
                 adaptor.append(frame.capturedImage, withPresentationTime: pts)
             }
 
-            // Depth — convert Float32 → BGRA greyscale, then append.
+            // Depth — upsample Float32 depth to camera resolution via guided bilateral filter,
+            // falling back to CPU BGRA conversion if Metal is unavailable.
             if let depthMap = frame.sceneDepth?.depthMap,
-               let pool     = depthPool,
                let adaptor  = depthAdaptor,
-               adaptor.assetWriterInput.isReadyForMoreMediaData,
-               let bgraBuffer = convertDepthToBGRA(depthMap, pool: pool, maxDepth: capturedMaxDepth) {
-                adaptor.append(bgraBuffer, withPresentationTime: pts)
+               adaptor.assetWriterInput.isReadyForMoreMediaData {
+                let rgb = frame.capturedImage
+                if let up = upsampler,
+                   let bgraBuffer = up.upsample(depthMap: depthMap,
+                                                capturedImage: rgb,
+                                                maxDepth: capturedMaxDepth) {
+                    adaptor.append(bgraBuffer, withPresentationTime: pts)
+                } else if let pool = depthPool,
+                          let bgraBuffer = convertDepthToBGRA(depthMap, pool: pool,
+                                                              maxDepth: capturedMaxDepth) {
+                    adaptor.append(bgraBuffer, withPresentationTime: pts)
+                }
             }
         }
     }
@@ -106,9 +119,10 @@ final class DualVideoRecorder: ObservableObject {
         let rgbW   = CVPixelBufferGetWidth(rgbBuf)
         let rgbH   = CVPixelBufferGetHeight(rgbBuf)
 
-        guard let depthBuf = frame.sceneDepth?.depthMap else { return }
-        let depthW = CVPixelBufferGetWidth(depthBuf)
-        let depthH = CVPixelBufferGetHeight(depthBuf)
+        guard frame.sceneDepth?.depthMap != nil else { return }
+        // Depth video is recorded at full camera resolution (upsampled), not sensor 256×192.
+        let depthW = rgbW
+        let depthH = rgbH
 
         let ts   = Int(Date().timeIntervalSince1970)
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
@@ -138,12 +152,12 @@ final class DualVideoRecorder: ObservableObject {
         guard rw.canAdd(rgbInput) else { return }
         rw.add(rgbInput)
 
-        // --- Depth input (BGRA greyscale → H.264) ---
+        // --- Depth input (BGRA greyscale → H.264, upsampled to camera resolution) ---
         let depthInput = AVAssetWriterInput(mediaType: .video, outputSettings: [
             AVVideoCodecKey:  AVVideoCodecType.h264,
             AVVideoWidthKey:  depthW,
             AVVideoHeightKey: depthH,
-            AVVideoCompressionPropertiesKey: [AVVideoAverageBitRateKey: 1_000_000]
+            AVVideoCompressionPropertiesKey: [AVVideoAverageBitRateKey: 8_000_000]
         ])
         depthInput.expectsMediaDataInRealTime = true
         depthInput.transform = CGAffineTransform(rotationAngle: .pi / 2)

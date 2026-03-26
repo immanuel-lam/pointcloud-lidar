@@ -124,25 +124,63 @@ struct DepthOverlayView: UIViewRepresentable {
 
 /// Generates depth images on a background queue and writes them straight to
 /// a UIImageView — no @Published, no SwiftUI re-renders while the overlay is live.
+/// On this branch the depth map is first upsampled to camera resolution via
+/// joint bilateral filtering (GuidedDepthUpsampler / Metal).
 final class DepthOverlayProcessor: ObservableObject {
 
     /// Weak so the UIImageView is released when the SwiftUI view is removed.
     weak var imageView: UIImageView?
     var isEnabled = false
 
-    private let queue = DispatchQueue(label: "com.immanuel.pointcloud.depthoverlay",
-                                      qos: .userInitiated)
+    private let queue     = DispatchQueue(label: "com.immanuel.pointcloud.depthoverlay",
+                                          qos: .userInitiated)
+    private let upsampler = GuidedDepthUpsampler()
 
     func process(frame: ARFrame, maxDepth: Float) {
         guard isEnabled, imageView != nil,
               let depthMap = frame.sceneDepth?.depthMap else { return }
+        let rgb = frame.capturedImage
         queue.async { [weak self] in
-            let img = Self.makeImage(from: depthMap, maxDepth: maxDepth)
-            DispatchQueue.main.async { self?.imageView?.image = img }
+            guard let self else { return }
+            let img: UIImage?
+            if let up = upsampler,
+               let bgra = up.upsample(depthMap: depthMap, capturedImage: rgb, maxDepth: maxDepth) {
+                img = Self.imageFromBGRA(bgra)
+            } else {
+                img = Self.makeImageCPU(from: depthMap, maxDepth: maxDepth)
+            }
+            DispatchQueue.main.async { self.imageView?.image = img }
         }
     }
 
-    private static func makeImage(from depthMap: CVPixelBuffer, maxDepth: Float) -> UIImage? {
+    /// Wrap an already-rendered BGRA CVPixelBuffer as a UIImage (portrait via .right).
+    private static func imageFromBGRA(_ buf: CVPixelBuffer) -> UIImage? {
+        CVPixelBufferLockBaseAddress(buf, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(buf, .readOnly) }
+        let w   = CVPixelBufferGetWidth(buf)
+        let h   = CVPixelBufferGetHeight(buf)
+        let bpr = CVPixelBufferGetBytesPerRow(buf)
+        guard let base = CVPixelBufferGetBaseAddress(buf) else { return nil }
+        guard let provider = CGDataProvider(
+                dataInfo: nil,
+                data: base, size: bpr * h,
+                releaseData: { _, _, _ in }),
+              let cg = CGImage(
+                  width: w, height: h,
+                  bitsPerComponent: 8, bitsPerPixel: 32,
+                  bytesPerRow: bpr,
+                  space: CGColorSpaceCreateDeviceRGB(),
+                  bitmapInfo: CGBitmapInfo(rawValue:
+                      CGImageAlphaInfo.noneSkipFirst.rawValue |
+                      CGBitmapInfo.byteOrder32Little.rawValue),
+                  provider: provider,
+                  decode: nil, shouldInterpolate: false,
+                  intent: .defaultIntent) else { return nil }
+        return UIImage(cgImage: cg, scale: 1.0, orientation: .right)
+    }
+
+    /// CPU fallback (used only if Metal unavailable).
+    private static func makeImageCPU(from depthMap: CVPixelBuffer, maxDepth: Float) -> UIImage? {
         CVPixelBufferLockBaseAddress(depthMap, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
 
