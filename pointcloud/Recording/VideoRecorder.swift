@@ -13,8 +13,10 @@ import Photos
 final class VideoRecorder: ObservableObject {
 
     @Published private(set) var isRecording = false
+    /// Flips to true momentarily after a successful Photos save; observe in the UI.
+    @Published private(set) var savedToPhotos = false
 
-    // All mutable state below is accessed only on recordingQueue
+    // All mutable recording state accessed only on recordingQueue.
     private var assetWriter: AVAssetWriter?
     private var videoInput: AVAssetWriterInput?
     private var adaptor: AVAssetWriterInputPixelBufferAdaptor?
@@ -23,27 +25,24 @@ final class VideoRecorder: ObservableObject {
 
     private let recordingQueue = DispatchQueue(label: "com.immanuel.pointcloud.recording",
                                                qos: .userInitiated)
-
-    private let width: Int
-    private let height: Int
     private let fps: Int
 
-    init(width: Int = 1920, height: Int = 1080, fps: Int = 30) {
-        self.width  = width
-        self.height = height
-        self.fps    = fps
+    init(fps: Int = 30) {
+        self.fps = fps
     }
 
+    /// Start recording at the drawable's actual pixel dimensions.
     @MainActor
-    func startRecording(device: MTLDevice) {
+    func startRecording(device: MTLDevice, drawableSize: CGSize) {
         guard !isRecording else { return }
 
-        // All value-type parameters that will be sent into the queue
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         let url  = docs.appendingPathComponent("pointcloud_\(Int(Date().timeIntervalSince1970)).mp4")
-        let w = width, h = height, f = fps
+        let w    = Int(drawableSize.width)
+        let h    = Int(drawableSize.height)
+        let f    = fps
 
-        // Create AVFoundation objects inside the queue to avoid @Sendable capture warnings
+        // Create all AVFoundation objects inside the queue to avoid @Sendable capture warnings.
         recordingQueue.sync {
             guard let writer = try? AVAssetWriter(outputURL: url, fileType: .mp4) else { return }
 
@@ -114,19 +113,25 @@ final class VideoRecorder: ObservableObject {
             writer.finishWriting {
                 DispatchQueue.main.async {
                     self.saveToPhotos(url: outputURL)
-                    self.cleanup()
                 }
             }
         }
     }
 
     private func saveToPhotos(url: URL) {
-        PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
-            guard status == .authorized || status == .limited else { return }
+        PHPhotoLibrary.requestAuthorization(for: .addOnly) { [weak self] status in
+            guard status == .authorized || status == .limited else {
+                DispatchQueue.main.async { self?.cleanup() }
+                return
+            }
             PHPhotoLibrary.shared().performChanges {
                 PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: url)
-            } completionHandler: { _, error in
+            } completionHandler: { [weak self] success, error in
                 if let error { print("Photos save error: \(error)") }
+                DispatchQueue.main.async {
+                    if success { self?.savedToPhotos = true }
+                    self?.cleanup()
+                }
             }
         }
     }

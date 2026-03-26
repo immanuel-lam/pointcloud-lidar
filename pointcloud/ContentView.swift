@@ -8,21 +8,22 @@
 import SwiftUI
 import MetalKit
 import ARKit
+import AVFoundation
 
 @MainActor
 struct ContentView: View {
 
-    @StateObject private var arSession  = ARSessionManager()
-    @StateObject private var recorder   = VideoRecorder(width: 1920, height: 1080, fps: 30)
+    @StateObject private var arSession = ARSessionManager()
+    @StateObject private var recorder  = VideoRecorder(fps: 30)
 
     @State private var renderer: MetalRenderer?
     @State private var mtkView  = MTKView()
 
-    @State private var pointSize: Float  = 6.0
-    @State private var subsampleStep     = 4
-    @State private var showSavedToast    = false
-    @State private var showSettings      = false
-    @State private var settings          = RecordingSettings()
+    @State private var pointSize: Float = 6.0
+    @State private var subsampleStep    = 4
+    @State private var showSavedToast   = false
+    @State private var showSettings     = false
+    @State private var settings         = RecordingSettings()
 
     private let processor = DepthFrameProcessor()
 
@@ -34,7 +35,7 @@ struct ContentView: View {
                     .ignoresSafeArea()
                     .onAppear {
                         setupRenderer()
-                        arSession.start()
+                        requestCameraAndStartAR()
                     }
                     .onDisappear {
                         arSession.pause()
@@ -44,9 +45,7 @@ struct ContentView: View {
                 VStack {
                     HStack {
                         Spacer()
-                        Button {
-                            showSettings = true
-                        } label: {
+                        Button { showSettings = true } label: {
                             Image(systemName: "gear")
                                 .font(.title2)
                                 .foregroundStyle(.white)
@@ -62,10 +61,9 @@ struct ContentView: View {
 
                 // HUD overlay
                 ControlBar(
-                    isRecording:   .init(get: { recorder.isRecording },
-                                         set: { _ in }),
-                    pointSize:     $pointSize,
-                    subsampleStep: $subsampleStep,
+                    isRecording:    .init(get: { recorder.isRecording }, set: { _ in }),
+                    pointSize:      $pointSize,
+                    subsampleStep:  $subsampleStep,
                     showSavedToast: showSavedToast,
                     onRecordToggle: toggleRecording
                 )
@@ -74,12 +72,9 @@ struct ContentView: View {
             }
         }
         .background(Color.black)
-        .onChange(of: pointSize) { _, size in
-            renderer?.pointSize = size
-        }
-        .onChange(of: subsampleStep) { _, step in
-            processor.subsampleStep = step
-        }
+        .onChange(of: pointSize)            { _, size  in renderer?.pointSize = size }
+        .onChange(of: subsampleStep)        { _, step  in processor.subsampleStep = step }
+        .onChange(of: recorder.savedToPhotos) { _, saved in if saved { showToast() } }
         .sheet(isPresented: $showSettings) {
             SettingsPanel(settings: $settings)
         }
@@ -97,7 +92,6 @@ struct ContentView: View {
 
         arSession.onFrame = { [weak r] frame in
             guard let r else { return }
-            // Offload heavy depth processing off the main thread
             Task.detached(priority: .userInitiated) {
                 let vertices = proc.process(frame)
                 await MainActor.run {
@@ -110,6 +104,26 @@ struct ContentView: View {
         r.onFrameRendered = { [weak recorder] texture, time in
             recorder?.appendFrame(texture: texture, at: time)
         }
+
+    }
+
+    /// Explicitly request camera permission before starting the AR session.
+    /// ARKit will show the system prompt on its own, but requesting up-front
+    /// lets us handle denial cleanly.
+    private func requestCameraAndStartAR() {
+        switch AVCaptureDevice.authorizationStatus(for: .video) {
+        case .authorized:
+            arSession.start()
+        case .notDetermined:
+            let session = arSession
+            AVCaptureDevice.requestAccess(for: .video) { granted in
+                Task { @MainActor in
+                    if granted { session.start() }
+                }
+            }
+        default:
+            break  // UnsupportedDeviceView not shown; could add a camera-denied overlay
+        }
     }
 
     // MARK: - Recording
@@ -118,9 +132,9 @@ struct ContentView: View {
         guard let device = mtkView.device else { return }
         if recorder.isRecording {
             recorder.stopRecording()
-            showToast()
+            // Toast fires via onSavedToPhotos callback once Photos save completes.
         } else {
-            recorder.startRecording(device: device)
+            recorder.startRecording(device: device, drawableSize: mtkView.drawableSize)
         }
     }
 

@@ -58,11 +58,14 @@ final class PixelBufferPool {
               let cmd   = queue.makeCommandBuffer(),
               let blit  = cmd.makeBlitCommandEncoder() else { return nil }
 
+        // Use the texture's actual dimensions to avoid out-of-bounds blit.
+        // Pool width/height matches texture dimensions because we create the pool
+        // from the drawable size at recording start.
         blit.copy(
             from: texture,
             sourceSlice: 0, sourceLevel: 0,
             sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
-            sourceSize:   MTLSize(width: width, height: height, depth: 1),
+            sourceSize:   MTLSize(width: texture.width, height: texture.height, depth: 1),
             to: destTexture,
             destinationSlice: 0, destinationLevel: 0,
             destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
