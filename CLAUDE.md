@@ -1,10 +1,10 @@
 # CLAUDE.md — LiDAR Recorder Project
 
 ## Project overview
-Native iOS app using rear LiDAR + camera. Currently two branches:
+Native iOS app using rear LiDAR + camera. Two branches:
 
-- **`main`** (tagged `alpha`) — point cloud video recorder. Records RGB-coloured 3D point cloud to MP4. **Known bug: recorded video is rotated 90°.** Live preview works. Point cloud follows camera like a live feed.
-- **`v2`** (active) — new direction: record **standard RGB video** + **separate depth map video** as two MP4 files, synced frame-for-frame. No point cloud rendering needed.
+- **`v1`** (tagged `alpha`) — point cloud video recorder. Records RGB-coloured 3D point cloud to MP4. **Known bug: recorded video is rotated 90°.** Live preview works. Point cloud follows camera like a live feed. **Archived — do not develop here.**
+- **`main`** (active) — records **standard RGB video** + **separate depth map video** as two MP4 files, synced frame-for-frame. No point cloud rendering needed. **All work happens here.**
 
 ## Xcode project
 - Path: `/Users/immanuellam/Documents/pointcloud/pointcloud.xcodeproj`
@@ -43,69 +43,69 @@ open('pointcloud.xcodeproj/project.pbxproj', 'w').write(content.replace(old, new
 ## Git workflow
 - Commit after every meaningful change — user tracks progress this way
 - Push to `origin` after each commit or logical group
-- Branch: currently on `v2`
-- Remote: `git@github.com:immanuel-lam/pointcloud-lidar.git` (SSH, key must be loaded)
+- Active branch: **`main`**
+- Remote: `git@github.com:immanuel-lam/pointcloud-lidar.git`
+- `gh` CLI is installed and authenticated as `immanuel-lam`
 
 ---
 
-## v2 plan — RGB video + depth map video
+## main branch plan — RGB video + depth map video
 
 ### What to build
 When user taps record, simultaneously record **two separate MP4 files**:
-1. `rgb_<timestamp>.mp4` — standard H.264 colour video from `frame.capturedImage` (YCbCr → BGRA)
-2. `depth_<timestamp>.mp4` — grayscale depth map video, each pixel encodes depth (near=white/255, far=black/0), normalised across a configurable range (e.g. 0–5 m)
+1. `rgb_<timestamp>.mp4` — standard H.264 colour video from `frame.capturedImage` (YCbCr)
+2. `depth_<timestamp>.mp4` — greyscale depth map video, each pixel encodes depth (near=white/255, far=black/0), normalised over a configurable range (default 0–5 m)
 
 Both files saved to Photos library on stop.
 
-### Files to create (v2)
+### Files to create
 ```
 pointcloud/
 ├── AR/
-│   └── ARSessionManager.swift    — reuse from alpha (same ARKit setup)
+│   └── ARSessionManager.swift    — reuse from v1 (same ARKit setup)
 ├── Recording/
-│   ├── DualVideoRecorder.swift   — new: records both streams simultaneously
-│   └── PixelBufferPool.swift     — reuse/adapt from alpha
+│   ├── DualVideoRecorder.swift   — records both streams simultaneously
+│   └── PixelBufferPool.swift     — reuse/adapt from v1
 ├── UI/
-│   ├── CameraPreviewView.swift   — new: shows live RGB camera feed
-│   └── ControlBar.swift          — simpler than alpha (just record + timer)
-└── ContentView.swift             — new root view
+│   ├── CameraPreviewView.swift   — shows live RGB camera feed (MTKView blit or ARSCNView)
+│   └── ControlBar.swift          — record button + timer
+└── ContentView.swift             — root view
 ```
 
-### Key implementation notes for v2
+### Key implementation notes
 
-**RGB video**: `frame.capturedImage` is a YCbCr 4:2:0 CVPixelBuffer. Convert to BGRA before encoding:
-- Use `vImageConvert_YpCbCrToARGB_GenerateConversion` from Accelerate, or
-- Use a `CIContext` with `CIFilter` (simpler but slower), or
-- Use `AVCaptureVideoDataOutput` instead of ARKit for the RGB stream (cleanest)
+**RGB video**: `frame.capturedImage` is `kCVPixelFormatType_420YpCbCr8BiPlanarFullRange`.
+Pass it directly to `AVAssetWriterInput` — no conversion needed, H.264 accepts YCbCr natively.
+Set `AVVideoColorPropertiesKey` if colour accuracy matters.
 
-Actually simplest: use `VTPixelTransferSession` or just pass the YCbCr buffer directly since `AVAssetWriterInput` accepts `kCVPixelFormatType_420YpCbCr8BiPlanarFullRange`.
-
-**Depth map video**: `frame.sceneDepth?.depthMap` is `kCVPixelFormatType_DepthFloat32`.
-- Normalise each Float32 pixel: `pixel_u8 = clamp(1 - depth/maxDepth, 0, 1) * 255`
-- Output as `kCVPixelFormatType_32BGRA` grayscale (R=G=B=pixel_u8)
+**Depth map video**: `frame.sceneDepth?.depthMap` is `kCVPixelFormatType_DepthFloat32` (landscape ~256×192).
+- Normalise: `pixel_u8 = UInt8(clamp(1 - depth/maxDepth, 0, 1) * 255)`
+- Write as `kCVPixelFormatType_32BGRA` greyscale (R=G=B=pixel_u8, A=255)
 - Max depth configurable, default 5 m
+
+**Video orientation**: Set `input.transform = CGAffineTransform(rotationAngle: .pi / 2)` on BOTH `AVAssetWriterInput`s — this is required for portrait video on iOS to display correctly in AE and Photos without rotation.
 
 **Synchronisation**: Both recorders use the same `frame.timestamp` as presentation time — guaranteed sync.
 
-**Camera preview**: Use `ARSCNView` or a simple Metal blit of `frame.capturedImage` to an MTKView, or use `UIImageView` updated each frame (simplest for v2).
+**Camera preview**: Blit `frame.capturedImage` to an MTKView each frame using a simple Metal blit pipeline, OR use `ARSCNView`/`ARCoachingOverlayView`. MTKView blit is cleanest.
 
-**No Metal rendering needed** — v2 doesn't render a point cloud, so no Metal shaders required.
+**No Metal point cloud rendering needed** — v1 shaders/renderer can be deleted.
 
-### Permission keys already in Info.plist
+### Permission keys already in pbxproj
 - `NSCameraUsageDescription` ✓
 - `NSMicrophoneUsageDescription` ✓
 - `NSPhotoLibraryAddUsageDescription` ✓
 
 ---
 
-## alpha branch known issues (do not fix on v2 branch)
-1. **Video rotated 90°** — `AVAssetWriterInput` needs `transform = CGAffineTransform(rotationAngle: .pi / 2)` when drawable is portrait, or the drawable dimensions may be landscape (need to verify with print). To debug: add `print("Recording at \(w)x\(h)")` in `VideoRecorder.startRecording`.
-2. **Confidence filter** — currently `>= medium`. Could go lower for denser point clouds.
-
 ## ARKit depth notes
 - `frame.sceneDepth` — raw depth, lower latency
 - `frame.smoothedSceneDepth` — temporally smoothed, less flicker
 - `depthMap` format: `kCVPixelFormatType_DepthFloat32`, landscape orientation (~256×192 on iPhone 16 Pro Max)
 - `confidenceMap` format: `kCVPixelFormatType_OneComponent8`, values 0=low, 1=medium, 2=high
-- Intrinsics (`frame.camera.intrinsics`) are for the RGB camera resolution — MUST scale to depth map resolution before using for depth unprojection
 - Both depth map and capturedImage are in **landscape** orientation regardless of device orientation
+- Intrinsics (`frame.camera.intrinsics`) are for the RGB camera resolution — scale to depth map res if needed for 3D math
+
+## v1 known issues (archived, for reference)
+1. **Video rotated 90°** — `AVAssetWriterInput.transform` was never set. Fix: `input.transform = CGAffineTransform(rotationAngle: .pi / 2)` for portrait.
+2. Point cloud rendering worked but was computationally heavy.
