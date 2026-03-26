@@ -11,6 +11,7 @@ struct ControlBar: View {
 
     @Binding var isRecording: Bool
     @Binding var maxDepth: Float
+    @Binding var showDepthOverlay: Bool
     var showSavedToast: Bool
 
     let onRecordToggle: () -> Void
@@ -61,15 +62,25 @@ struct ControlBar: View {
 
                 Spacer()
 
-                // Elapsed timer (right-aligned placeholder so button stays centred)
-                VStack(alignment: .trailing, spacing: 2) {
+                // Right column: overlay toggle + elapsed timer
+                VStack(alignment: .trailing, spacing: 6) {
+                    Button {
+                        showDepthOverlay.toggle()
+                    } label: {
+                        Image(systemName: showDepthOverlay ? "eye.fill" : "eye")
+                            .font(.title3)
+                            .foregroundStyle(showDepthOverlay ? .yellow : .white)
+                            .padding(8)
+                            .background(.ultraThinMaterial, in: Circle())
+                    }
+
                     if isRecording {
                         Text(formattedElapsed)
                             .font(.system(.caption, design: .monospaced))
                             .foregroundStyle(.red)
                     }
                 }
-                .frame(width: 110)
+                .frame(width: 110, alignment: .trailing)
             }
         }
         .padding(.horizontal, 24)
