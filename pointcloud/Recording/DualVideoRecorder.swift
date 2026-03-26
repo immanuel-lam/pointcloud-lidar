@@ -66,7 +66,7 @@ final class DualVideoRecorder: ObservableObject {
             }
 
             // Depth — convert Float32 → BGRA greyscale, then append.
-            if let depthMap = frame.sceneDepth?.depthMap,
+            if let depthMap = frame.smoothedSceneDepth?.depthMap,
                let pool     = depthPool,
                let adaptor  = depthAdaptor,
                adaptor.assetWriterInput.isReadyForMoreMediaData,
@@ -106,7 +106,7 @@ final class DualVideoRecorder: ObservableObject {
         let rgbW   = CVPixelBufferGetWidth(rgbBuf)
         let rgbH   = CVPixelBufferGetHeight(rgbBuf)
 
-        guard let depthBuf = frame.sceneDepth?.depthMap else { return }
+        guard let depthBuf = frame.smoothedSceneDepth?.depthMap else { return }
         let depthW = CVPixelBufferGetWidth(depthBuf)
         let depthH = CVPixelBufferGetHeight(depthBuf)
 

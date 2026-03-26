@@ -135,7 +135,7 @@ final class DepthOverlayProcessor: ObservableObject {
 
     func process(frame: ARFrame, maxDepth: Float) {
         guard isEnabled, imageView != nil,
-              let depthMap = frame.sceneDepth?.depthMap else { return }
+              let depthMap = frame.smoothedSceneDepth?.depthMap else { return }
         queue.async { [weak self] in
             let img = Self.makeImage(from: depthMap, maxDepth: maxDepth)
             DispatchQueue.main.async { self?.imageView?.image = img }
