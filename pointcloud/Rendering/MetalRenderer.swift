@@ -94,11 +94,15 @@ final class MetalRenderer: NSObject {
     // MARK: - Public API
 
     func updateCamera(frame: ARFrame, viewportSize: CGSize) {
+        // Points are already in camera space (computed via depth intrinsics).
+        // projectionMatrix(for: .portrait) includes the 90° landscape→portrait rotation.
+        // viewMatrix must be identity — applying the world-to-camera transform to
+        // camera-space points causes incorrect rotation and translation.
         projectionMatrix = frame.camera.projectionMatrix(for: .portrait,
                                                           viewportSize: viewportSize,
                                                           zNear: 0.01,
                                                           zFar: 20.0)
-        viewMatrix = frame.camera.viewMatrix(for: .portrait)
+        viewMatrix = matrix_identity_float4x4
         frameTimestamp = CMTime(seconds: frame.timestamp, preferredTimescale: 600)
     }
 }
