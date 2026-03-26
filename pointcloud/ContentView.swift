@@ -6,7 +6,6 @@
 //
 
 import SwiftUI
-import MetalKit
 import ARKit
 import AVFoundation
 
@@ -14,56 +13,28 @@ import AVFoundation
 struct ContentView: View {
 
     @StateObject private var arSession = ARSessionManager()
-    @StateObject private var recorder  = VideoRecorder(fps: 30)
+    @StateObject private var recorder  = DualVideoRecorder()
 
-    @State private var renderer: MetalRenderer?
-    @State private var mtkView  = MTKView()
-
-    @State private var pointSize: Float = 6.0
-    @State private var subsampleStep    = 4
-    @State private var showSavedToast   = false
-    @State private var showSettings     = false
-    @State private var settings         = RecordingSettings()
-
-    private let processor = DepthFrameProcessor()
+    @State private var showSavedToast = false
 
     var body: some View {
         ZStack(alignment: .bottom) {
             if arSession.isSupported {
-                // Full-screen Metal view
-                MetalViewWrapper(mtkView: mtkView)
+                CameraPreviewView(session: arSession.session)
                     .ignoresSafeArea()
                     .onAppear {
-                        setupRenderer()
+                        setupFrameCallback()
                         requestCameraAndStartAR()
                     }
                     .onDisappear {
                         arSession.pause()
                     }
 
-                // Settings button
-                VStack {
-                    HStack {
-                        Spacer()
-                        Button { showSettings = true } label: {
-                            Image(systemName: "gear")
-                                .font(.title2)
-                                .foregroundStyle(.white)
-                                .padding(12)
-                                .background(.ultraThinMaterial, in: Circle())
-                        }
-                        .padding(.trailing, 20)
-                        .padding(.top, 60)
-                    }
-                    Spacer()
-                }
-                .ignoresSafeArea()
-
-                // HUD overlay
                 ControlBar(
                     isRecording:    .init(get: { recorder.isRecording }, set: { _ in }),
-                    pointSize:      $pointSize,
-                    subsampleStep:  $subsampleStep,
+                    maxDepth:       Binding(
+                                        get: { recorder.maxDepth },
+                                        set: { recorder.maxDepth = $0 }),
                     showSavedToast: showSavedToast,
                     onRecordToggle: toggleRecording
                 )
@@ -72,44 +43,17 @@ struct ContentView: View {
             }
         }
         .background(Color.black)
-        .onChange(of: pointSize)            { _, size  in renderer?.pointSize = size }
-        .onChange(of: subsampleStep)        { _, step  in processor.subsampleStep = step }
         .onChange(of: recorder.savedToPhotos) { _, saved in if saved { showToast() } }
-        .sheet(isPresented: $showSettings) {
-            SettingsPanel(settings: $settings)
-        }
     }
 
     // MARK: - Setup
 
-    private func setupRenderer() {
-        guard renderer == nil else { return }
-        guard let r = MetalRenderer(mtkView: mtkView) else { return }
-        renderer = r
-
-        let proc    = processor
-        let mtkView = mtkView
-
-        arSession.onFrame = { [weak r] frame in
-            guard let r else { return }
-            Task.detached(priority: .userInitiated) {
-                let vertices = proc.process(frame)
-                await MainActor.run {
-                    r.currentVertices = vertices
-                    r.updateCamera(frame: frame, viewportSize: mtkView.drawableSize)
-                }
-            }
+    private func setupFrameCallback() {
+        arSession.onFrame = { [weak recorder] frame in
+            recorder?.appendFrame(frame)
         }
-
-        r.onFrameRendered = { [weak recorder] texture, time in
-            recorder?.appendFrame(texture: texture, at: time)
-        }
-
     }
 
-    /// Explicitly request camera permission before starting the AR session.
-    /// ARKit will show the system prompt on its own, but requesting up-front
-    /// lets us handle denial cleanly.
     private func requestCameraAndStartAR() {
         switch AVCaptureDevice.authorizationStatus(for: .video) {
         case .authorized:
@@ -117,24 +61,20 @@ struct ContentView: View {
         case .notDetermined:
             let session = arSession
             AVCaptureDevice.requestAccess(for: .video) { granted in
-                Task { @MainActor in
-                    if granted { session.start() }
-                }
+                Task { @MainActor in if granted { session.start() } }
             }
         default:
-            break  // UnsupportedDeviceView not shown; could add a camera-denied overlay
+            break
         }
     }
 
     // MARK: - Recording
 
     private func toggleRecording() {
-        guard let device = mtkView.device else { return }
         if recorder.isRecording {
             recorder.stopRecording()
-            // Toast fires via onSavedToPhotos callback once Photos save completes.
         } else {
-            recorder.startRecording(device: device, drawableSize: mtkView.drawableSize)
+            recorder.startRecording()
         }
     }
 
@@ -145,22 +85,6 @@ struct ContentView: View {
             withAnimation { showSavedToast = false }
         }
     }
-}
-
-// MARK: - MTKView wrapper
-
-struct MetalViewWrapper: UIViewRepresentable {
-    let mtkView: MTKView
-
-    func makeUIView(context: Context) -> MTKView {
-        mtkView.backgroundColor = .black
-        mtkView.isPaused        = false
-        mtkView.enableSetNeedsDisplay = false
-        mtkView.preferredFramesPerSecond = 60
-        return mtkView
-    }
-
-    func updateUIView(_ uiView: MTKView, context: Context) {}
 }
 
 // MARK: - Unsupported device

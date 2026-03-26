@@ -10,8 +10,7 @@ import SwiftUI
 struct ControlBar: View {
 
     @Binding var isRecording: Bool
-    @Binding var pointSize: Float
-    @Binding var subsampleStep: Int
+    @Binding var maxDepth: Float
     var showSavedToast: Bool
 
     let onRecordToggle: () -> Void
@@ -31,12 +30,12 @@ struct ControlBar: View {
             }
 
             HStack(spacing: 20) {
-                // Dot size
+                // Max depth slider
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Dot: \(Int(pointSize))pt")
+                    Text("Depth: \(String(format: "%.1f", maxDepth)) m")
                         .font(.caption2).foregroundStyle(.white)
-                    Slider(value: $pointSize, in: 2...12, step: 1)
-                        .frame(width: 100)
+                    Slider(value: $maxDepth, in: 1...10, step: 0.5)
+                        .frame(width: 110)
                         .tint(.white)
                 }
 
@@ -62,23 +61,15 @@ struct ControlBar: View {
 
                 Spacer()
 
-                // Density
+                // Elapsed timer (right-aligned placeholder so button stays centred)
                 VStack(alignment: .trailing, spacing: 2) {
-                    Text("Step: \(subsampleStep)")
-                        .font(.caption2).foregroundStyle(.white)
-                    Slider(value: Binding(
-                        get: { Double(subsampleStep) },
-                        set: { subsampleStep = Int($0) }
-                    ), in: 2...8, step: 1)
-                    .frame(width: 100)
-                    .tint(.white)
+                    if isRecording {
+                        Text(formattedElapsed)
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundStyle(.red)
+                    }
                 }
-            }
-
-            if isRecording {
-                Text(formattedElapsed)
-                    .font(.system(.caption, design: .monospaced))
-                    .foregroundStyle(.red)
+                .frame(width: 110)
             }
         }
         .padding(.horizontal, 24)
@@ -87,13 +78,9 @@ struct ControlBar: View {
         .onChange(of: isRecording) { _, recording in
             if recording {
                 elapsed = 0
-                timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in
-                    elapsed += 1
-                }
+                timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in elapsed += 1 }
             } else {
-                timer?.invalidate()
-                timer = nil
-                elapsed = 0
+                timer?.invalidate(); timer = nil; elapsed = 0
             }
         }
     }
