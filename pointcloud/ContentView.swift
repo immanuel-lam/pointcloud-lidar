@@ -21,6 +21,8 @@ struct ContentView: View {
     @State private var pointSize: Float  = 6.0
     @State private var subsampleStep     = 4
     @State private var showSavedToast    = false
+    @State private var showSettings      = false
+    @State private var settings          = RecordingSettings()
 
     private let processor = DepthFrameProcessor()
 
@@ -37,6 +39,26 @@ struct ContentView: View {
                     .onDisappear {
                         arSession.pause()
                     }
+
+                // Settings button
+                VStack {
+                    HStack {
+                        Spacer()
+                        Button {
+                            showSettings = true
+                        } label: {
+                            Image(systemName: "gear")
+                                .font(.title2)
+                                .foregroundStyle(.white)
+                                .padding(12)
+                                .background(.ultraThinMaterial, in: Circle())
+                        }
+                        .padding(.trailing, 20)
+                        .padding(.top, 60)
+                    }
+                    Spacer()
+                }
+                .ignoresSafeArea()
 
                 // HUD overlay
                 ControlBar(
@@ -57,6 +79,9 @@ struct ContentView: View {
         }
         .onChange(of: subsampleStep) { _, step in
             processor.subsampleStep = step
+        }
+        .sheet(isPresented: $showSettings) {
+            SettingsPanel(settings: $settings)
         }
     }
 
